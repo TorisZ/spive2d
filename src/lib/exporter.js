@@ -1,6 +1,7 @@
 import { appState } from './appState.svelte.js';
 import { parseBackgroundImageUrl, loadImage } from './utils.js';
 import { getRenderer } from './rendererStore.svelte.js';
+import { getActiveLayerId } from './layerStore.svelte.js';
 import { createRenderer } from './renderer/createRenderer.js';
 import { showNotification } from './notificationStore.svelte.js';
 import { t } from './i18n.svelte.js';
@@ -356,6 +357,399 @@ export async function exportAnimation(sceneText, animationName, animationValue, 
       }
     });
   }
+}
+
+// ─── Multi-layer helpers ─────────────────────────────────────────────────────
+
+/**
+ * Creates and fully configures a hidden (offscreen) renderer from a layer object.
+ * Returns the renderer, or null if loading fails.
+ */
+async function createHiddenRendererFromLayer(layer, contentWidth, contentHeight) {
+  const { files, selectedDir, selectedScene } = layer.directories;
+  if (!files || !selectedDir || !files[selectedDir]) return null;
+  const fileNames = files[selectedDir][selectedScene];
+  if (!fileNames) return null;
+
+  const hiddenRenderer = createRenderer(fileNames, true);
+  if (hiddenRenderer.setAlphaMode) hiddenRenderer.setAlphaMode(appState.alphaMode);
+
+  try {
+    await hiddenRenderer.load(selectedDir, fileNames);
+  } catch (err) {
+    console.error('Failed to load hidden renderer for layer', layer.label, err);
+    hiddenRenderer.dispose();
+    return null;
+  }
+
+  if (layer.selectedAnimation) await hiddenRenderer.setAnimation(layer.selectedAnimation);
+  if (layer.selectedExpression && 'setExpression' in hiddenRenderer) {
+    hiddenRenderer.setExpression(layer.selectedExpression);
+  }
+
+  if ('resize' in hiddenRenderer) hiddenRenderer.resize(contentWidth, contentHeight);
+  if ('applyTransform' in hiddenRenderer) {
+    hiddenRenderer.applyTransform(
+      layer.transform.scale, layer.transform.moveX,
+      layer.transform.moveY, layer.transform.rotate
+    );
+  }
+  // Propagate reference bounds so grouped layers share the same MVP space
+  if (hiddenRenderer.setReferenceBounds && layer.renderer?._referenceBounds) {
+    hiddenRenderer.setReferenceBounds(layer.renderer._referenceBounds);
+  }
+
+  const allSkins = layer.renderer?.getPropertyItems?.('skins') || [];
+  if (allSkins.length > 0 && 'applySkins' in hiddenRenderer) {
+    const activeSkins = allSkins.filter(item => item.checked).map(item => item.name);
+    if (activeSkins.length > 0) hiddenRenderer.applySkins(activeSkins);
+  }
+
+  if ('setSpeed' in hiddenRenderer) hiddenRenderer.setSpeed(layer.animSpeed || 1.0);
+  if ('setPaused' in hiddenRenderer) hiddenRenderer.setPaused(true);
+
+  hiddenRenderer.getPropertyItems?.('parameters');
+  const activeParams = layer.renderer?.getPropertyItems?.('parameters') || [];
+  for (const p of activeParams) {
+    hiddenRenderer.updatePropertyItem('parameters', p.name, p.index, p.value);
+  }
+
+  const syncVisibilityProps = ['attachments', 'parts', 'drawables'];
+  for (const propCategory of syncVisibilityProps) {
+    hiddenRenderer.getPropertyItems?.(propCategory);
+    const props = layer.renderer?.getPropertyItems?.(propCategory) || [];
+    for (const p of props) {
+      if (p.type === 'checkbox' && p.checked === false) {
+        hiddenRenderer.updatePropertyItem(propCategory, p.name, p.index, false);
+      }
+    }
+  }
+
+  return hiddenRenderer;
+}
+
+// ─── Multi-layer exports ─────────────────────────────────────────────────────
+
+/**
+ * Exports a snapshot that composites all visible layers in z-order.
+ */
+export async function exportAllLayersImage(layers, sceneText, animationName) {
+  const taskId = `image-${++taskIdCounter}`;
+  const safeName = animationName ? animationName.split('.')[0] : 'snapshot';
+  const baseFilename = `${sceneText}_${safeName}`;
+  exportQueue.add({ id: taskId, type: 'Image', name: baseFilename, progress: 100, status: 'processing' });
+  try {
+    const visibleLayers = layers.filter(l => l.visible);
+    const activeRenderer = getRenderer();
+    if (!activeRenderer || visibleLayers.length === 0) {
+      exportQueue.updateStatus(taskId, 'error');
+      return;
+    }
+    const backgroundColor = document.body.style.backgroundColor;
+    const backgroundImage = document.body.style.backgroundImage;
+    const imageUrl = parseBackgroundImageUrl(backgroundImage);
+    const { finalWidth, finalHeight, marginX, marginY } = getFinalExportSize(activeRenderer);
+
+    const tempCanvas = createOffscreenCanvas(finalWidth, finalHeight);
+    const ctx = tempCanvas.getContext('2d');
+    if (imageUrl) {
+      const img = await loadImage(imageUrl);
+      drawBackground(ctx, finalWidth, finalHeight, img, null);
+    } else {
+      drawBackground(ctx, finalWidth, finalHeight, null, backgroundColor);
+    }
+
+    for (const layer of visibleLayers) {
+      const capturedCanvas = layer.renderer.captureFrame?.(finalWidth, finalHeight, {
+        ignoreTransform: appState.exportBase === 'original',
+        marginX,
+        marginY
+      });
+      if (capturedCanvas && ctx && 'drawImage' in ctx) {
+        const prev = ctx.globalAlpha;
+        ctx.globalAlpha = layer.opacity;
+        ctx.drawImage(capturedCanvas, 0, 0);
+        ctx.globalAlpha = prev;
+      }
+    }
+
+    await downloadCanvas(tempCanvas, sceneText, animationName);
+    exportQueue.updateStatus(taskId, 'completed');
+  } catch (err) {
+    console.error('Failed to export all-layers image:', err);
+    exportQueue.updateStatus(taskId, 'error');
+  }
+}
+
+/**
+ * Exports a WebM video that composites all visible layers in z-order.
+ * Timing is driven by the active layer's animation.
+ */
+export async function exportAllLayersAnimation(layers, sceneText, animationName) {
+  const visibleLayers = layers.filter(l => l.visible);
+  if (visibleLayers.length === 0) return;
+  const activeRenderer = getRenderer();
+  if (!activeRenderer) return;
+  if (typeof VideoEncoder === 'undefined') {
+    showNotification(t('mediaRecorderNotSupported') || 'VideoEncoder API not supported', 'error');
+    return;
+  }
+
+  const taskId = `video-${++taskIdCounter}`;
+  const safeName = animationName ? animationName.split('.')[0] : 'animation';
+  const baseFilename = `${sceneText}_${safeName}`;
+  const worker = new Worker(new URL('./exporter.worker.js', import.meta.url), { type: 'module' });
+  exportQueue.add({ id: taskId, type: 'Video', name: baseFilename, progress: 0, status: 'processing', worker });
+
+  const backgroundColor = document.body.style.backgroundColor;
+  const backgroundImage = document.body.style.backgroundImage;
+  const imageUrl = parseBackgroundImageUrl(backgroundImage);
+  const backgroundImageToRender = imageUrl ? await loadImage(imageUrl) : null;
+
+  const { contentWidth, contentHeight, finalWidth: rawW, finalHeight: rawH, marginX, marginY } = getFinalExportSize(activeRenderer);
+  const finalWidth  = rawW % 2 === 0 ? rawW : rawW + 1;
+  const finalHeight = rawH % 2 === 0 ? rawH : rawH + 1;
+
+  const hiddenEntries = [];
+  for (const layer of visibleLayers) {
+    const hr = await createHiddenRendererFromLayer(layer, contentWidth, contentHeight);
+    if (hr) hiddenEntries.push({ hiddenRenderer: hr, layer });
+  }
+  if (hiddenEntries.length === 0) {
+    exportQueue.updateStatus(taskId, 'error');
+    worker.terminate();
+    return;
+  }
+
+  const activeLayerId = getActiveLayerId();
+  const masterEntry = hiddenEntries.find(e => e.layer.id === activeLayerId) ?? hiddenEntries[0];
+  const masterRenderer = masterEntry.hiddenRenderer;
+  const speed = masterEntry.layer.animSpeed || appState.animation.speed || 1.0;
+  const baseDuration = masterRenderer.getAnimationDuration() || 0.1;
+  const fps = masterRenderer.getFPS?.() || RECORDING_FRAME_RATE;
+  const totalFrames = Math.ceil((baseDuration / speed) * fps);
+
+  function cleanup() {
+    for (const { hiddenRenderer } of hiddenEntries) hiddenRenderer.dispose();
+  }
+
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = finalWidth;
+  tempCanvas.height = finalHeight;
+  const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
+  let currentWorkerFrame = 0;
+
+  worker.onmessage = async (e) => {
+    const item = exportQueue.items.find(i => i.id === taskId);
+    if (!item || item.status === 'cancelled') { worker.terminate(); cleanup(); return; }
+
+    if (e.data.type === 'STARTED') {
+      for (const { hiddenRenderer } of hiddenEntries) {
+        if ('seekAnimation' in hiddenRenderer) hiddenRenderer.seekAnimation(0);
+      }
+      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+      processNextFrame(0);
+    } else if (e.data.type === 'FRAME_ADDED') {
+      currentWorkerFrame++;
+      exportQueue.updateProgress(taskId, (currentWorkerFrame / totalFrames) * 100);
+      processNextFrame(currentWorkerFrame);
+    } else if (e.data.type === 'DONE_VIDEO') {
+      const buffer = e.data.buffer;
+      try {
+        const baseDir = await downloadDir();
+        const exportBaseDir = await join(baseDir, 'spive2d_export');
+        await mkdir(exportBaseDir, { recursive: true });
+        let finalOutputFilename = `${baseFilename}.webm`;
+        let filePath = await join(exportBaseDir, finalOutputFilename);
+        let counter = 1;
+        while (await exists(filePath)) {
+          finalOutputFilename = `${baseFilename} (${counter}).webm`;
+          filePath = await join(exportBaseDir, finalOutputFilename);
+          counter++;
+        }
+        await writeFile(filePath, new Uint8Array(buffer));
+        exportQueue.updateStatus(taskId, 'completed');
+      } catch (err) {
+        console.error('Failed to write video:', err);
+        exportQueue.updateStatus(taskId, 'error');
+      } finally {
+        worker.terminate();
+        cleanup();
+      }
+    } else if (e.data.type === 'ERROR') {
+      exportQueue.updateStatus(taskId, 'error');
+      console.error('Worker error:', e.data.error);
+      worker.terminate();
+      cleanup();
+    }
+  };
+
+  worker.postMessage({ type: 'START_VIDEO', id: taskId, width: finalWidth, height: finalHeight, bitrate: RECORDING_BITRATE, fps });
+
+  async function processNextFrame(frame) {
+    const item = exportQueue.items.find(i => i.id === taskId);
+    if (!item || item.status === 'cancelled') { cleanup(); return; }
+    if (frame >= totalFrames) { worker.postMessage({ type: 'FINISH_VIDEO', id: taskId }); return; }
+
+    const time = frame / fps;
+    const progress = baseDuration > 0 ? Math.min(1, (time * speed) / baseDuration) : 0;
+    for (const { hiddenRenderer } of hiddenEntries) {
+      if ('seekAnimation' in hiddenRenderer) hiddenRenderer.seekAnimation(progress);
+    }
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    tempCtx.clearRect(0, 0, finalWidth, finalHeight);
+    if (backgroundImageToRender) {
+      drawBackground(tempCtx, finalWidth, finalHeight, backgroundImageToRender, null);
+    } else if (backgroundColor) {
+      drawBackground(tempCtx, finalWidth, finalHeight, null, backgroundColor);
+    }
+    for (const { hiddenRenderer, layer } of hiddenEntries) {
+      const capturedCanvas = 'captureFrame' in hiddenRenderer
+        ? hiddenRenderer.captureFrame(finalWidth, finalHeight, { marginX, marginY })
+        : hiddenRenderer.getCanvas();
+      if (capturedCanvas) {
+        const prev = tempCtx.globalAlpha;
+        tempCtx.globalAlpha = layer.opacity;
+        tempCtx.drawImage(capturedCanvas, 0, 0);
+        tempCtx.globalAlpha = prev;
+      }
+    }
+    createImageBitmap(tempCanvas).then((bitmap) => {
+      if (item.status !== 'cancelled') {
+        worker.postMessage({ type: 'ADD_FRAME_VIDEO', id: taskId, bitmap, time }, [bitmap]);
+      }
+    });
+  }
+}
+
+/**
+ * Exports a PNG image sequence that composites all visible layers in z-order.
+ * Timing is driven by the active layer's animation.
+ */
+export async function exportAllLayersImageSequence(layers, targetDir, sceneText, animationName) {
+  const visibleLayers = layers.filter(l => l.visible);
+  if (visibleLayers.length === 0) return;
+  const activeRenderer = getRenderer();
+  if (!activeRenderer) return;
+
+  const taskId = `png-${++taskIdCounter}`;
+  const safeName = animationName ? animationName.split('.')[0] : 'sequence';
+  const baseFilename = `${sceneText}_${safeName}`;
+  const worker = new Worker(new URL('./exporter.worker.js', import.meta.url), { type: 'module' });
+  exportQueue.add({ id: taskId, type: 'PNG Sequence', name: baseFilename, progress: 0, status: 'processing', worker });
+
+  const backgroundColor = document.body.style.backgroundColor;
+  const backgroundImage = document.body.style.backgroundImage;
+  const imageUrl = parseBackgroundImageUrl(backgroundImage);
+  const backgroundImageToRender = imageUrl ? await loadImage(imageUrl) : null;
+
+  const { contentWidth, contentHeight, finalWidth, finalHeight, marginX, marginY } = getFinalExportSize(activeRenderer);
+
+  const hiddenEntries = [];
+  for (const layer of visibleLayers) {
+    const hr = await createHiddenRendererFromLayer(layer, contentWidth, contentHeight);
+    if (hr) hiddenEntries.push({ hiddenRenderer: hr, layer });
+  }
+  if (hiddenEntries.length === 0) {
+    exportQueue.updateStatus(taskId, 'error');
+    worker.terminate();
+    return;
+  }
+
+  const activeLayerId = getActiveLayerId();
+  const masterEntry = hiddenEntries.find(e => e.layer.id === activeLayerId) ?? hiddenEntries[0];
+  const masterRenderer = masterEntry.hiddenRenderer;
+  const speed = masterEntry.layer.animSpeed || appState.animation.speed || 1.0;
+  const baseDuration = masterRenderer.getAnimationDuration() || 0.1;
+  const fps = masterRenderer.getFPS?.() || RECORDING_FRAME_RATE;
+  const totalFrames = Math.ceil((baseDuration / speed) * fps);
+
+  function cleanup() {
+    for (const { hiddenRenderer } of hiddenEntries) hiddenRenderer.dispose();
+  }
+
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = finalWidth;
+  tempCanvas.height = finalHeight;
+  const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
+
+  const writePromises = [];
+  let framesProcessed = 0;
+
+  worker.onmessage = async (e) => {
+    const item = exportQueue.items.find(i => i.id === taskId);
+    if (!item || item.status === 'cancelled') return;
+    if (e.data.type === 'FRAME_PNG_DONE') {
+      const { buffer, frameIndex } = e.data;
+      const frameStr = String(frameIndex).padStart(4, '0');
+      const filename = `${sceneText}_${safeName}_${frameStr}.png`;
+      const p = join(targetDir, filename).then(fp => writeFile(fp, new Uint8Array(buffer))).catch(err => {
+        console.error(`Failed to write frame ${frameIndex}:`, err);
+      });
+      writePromises.push(p);
+      framesProcessed++;
+      exportQueue.updateProgress(taskId, (framesProcessed / totalFrames) * 100);
+      if (writePromises.length >= 10) { await Promise.all(writePromises); writePromises.length = 0; }
+      if (framesProcessed >= totalFrames) {
+        if (writePromises.length > 0) await Promise.all(writePromises);
+        exportQueue.updateStatus(taskId, 'completed');
+        worker.terminate();
+        cleanup();
+      }
+    } else if (e.data.type === 'ERROR') {
+      console.error('Sequence worker error:', e.data.error);
+      exportQueue.updateStatus(taskId, 'error');
+      worker.terminate();
+      cleanup();
+    }
+  };
+
+  let currentWorkerFrame = 0;
+
+  async function processNextFrame() {
+    const item = exportQueue.items.find(i => i.id === taskId);
+    if (!item || item.status === 'cancelled') { cleanup(); return; }
+    if (currentWorkerFrame >= totalFrames) return;
+    const frame = currentWorkerFrame;
+    const time = frame / fps;
+    const progress = baseDuration > 0 ? Math.min(1, (time * speed) / baseDuration) : 0;
+
+    for (const { hiddenRenderer } of hiddenEntries) {
+      if ('seekAnimation' in hiddenRenderer) hiddenRenderer.seekAnimation(progress);
+    }
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    tempCtx.clearRect(0, 0, finalWidth, finalHeight);
+    if (backgroundImageToRender) {
+      drawBackground(tempCtx, finalWidth, finalHeight, backgroundImageToRender, null);
+    } else if (backgroundColor) {
+      drawBackground(tempCtx, finalWidth, finalHeight, null, backgroundColor);
+    }
+    for (const { hiddenRenderer, layer } of hiddenEntries) {
+      const capturedCanvas = 'captureFrame' in hiddenRenderer
+        ? hiddenRenderer.captureFrame(finalWidth, finalHeight, { marginX, marginY })
+        : hiddenRenderer.getCanvas();
+      if (capturedCanvas) {
+        const prev = tempCtx.globalAlpha;
+        tempCtx.globalAlpha = layer.opacity;
+        tempCtx.drawImage(capturedCanvas, 0, 0);
+        tempCtx.globalAlpha = prev;
+      }
+    }
+    createImageBitmap(tempCanvas).then((bitmap) => {
+      if (item.status !== 'cancelled') {
+        worker.postMessage({ type: 'PROCESS_FRAME_PNG', id: taskId, bitmap, frameIndex: frame }, [bitmap]);
+        currentWorkerFrame++;
+        setTimeout(processNextFrame, 0);
+      }
+    });
+  }
+
+  for (const { hiddenRenderer } of hiddenEntries) {
+    if ('seekAnimation' in hiddenRenderer) hiddenRenderer.seekAnimation(0);
+  }
+  requestAnimationFrame(() => requestAnimationFrame(() => processNextFrame()));
 }
 
 export async function exportImageSequence(targetDir, sceneText, animationName, animationValue, expressionValue, onProgress) {

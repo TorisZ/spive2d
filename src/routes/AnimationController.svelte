@@ -3,6 +3,8 @@
   import { getRenderer } from '$lib/rendererStore.svelte.js';
   import { formatFrames } from '$lib/utils.js';
 
+  let { onSyncAll } = $props();
+
   let visible = $state(false);
   let seekerValue = $state(0);
   let timeDisplay = $state('0 / 0');
@@ -129,6 +131,13 @@
     onchange={blurActiveElement}
   />
   <div id="animationTimeDisplay">{timeDisplay}</div>
+  <div class="divider"></div>
+  <!-- svelte-ignore a11y_consider_explicit_label -->
+  <button class="icon-button" onclick={onSyncAll} title="Sync all layers to animation start">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="white">
+      <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
+    </svg>
+  </button>
   <div class="divider"></div>
   <div class="speed-control">
     <span class="speed-label">Speed: {appState.animation.speed.toFixed(1)}x</span>

@@ -50,6 +50,10 @@
     selectedAnimation = value;
   }
 
+  export function setSelectedExpression(value) {
+    selectedExpression = value;
+  }
+
   export function navigateAnimation(delta) {
     if (animations.length <= 1) return;
     const currentIndex = animations.findIndex(a => a.value === selectedAnimation);

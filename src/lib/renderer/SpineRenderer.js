@@ -420,10 +420,32 @@ export class SpineRenderer {
     skeleton.updateWorldTransform(2);
     return { offset, size };
   }
+  /**
+   * Returns this renderer's natural skeleton bounds (computed at load time).
+   * Used by the layer system to compute a shared union bounds for grouped layers.
+   * @returns {{ offset: {x:number,y:number}, size: {x:number,y:number} }|null}
+   */
+  getBounds() {
+    return this.#skeletons['0']?.bounds ?? null;
+  }
+
+  /**
+   * Override the bounds used to compute the MVP matrix.
+   * Pass null to revert to natural skeleton bounds.
+   * Used by the layer system so all members of a group share the same
+   * coordinate space (union bounds), keeping them visually aligned.
+   * @param {{ offset: {x:number,y:number}, size: {x:number,y:number} }|null} bounds
+   */
+  setReferenceBounds(bounds) {
+    this._referenceBounds = bounds ?? null;
+  }
+
   #updateMVP(canvasWidth = this.#canvas.width, canvasHeight = this.#canvas.height, dpr = 1) {
     const logicalWidth = canvasWidth / dpr;
     const logicalHeight = canvasHeight / dpr;
-    const bounds = this.#skeletons['0'].bounds;
+    // Use externally provided reference bounds when set (group alignment),
+    // otherwise fall back to this skeleton's own natural bounds.
+    const bounds = this._referenceBounds ?? this.#skeletons['0'].bounds;
     const centerX = bounds.offset.x + bounds.size.x * 0.5;
     const centerY = bounds.offset.y + bounds.size.y * 0.5;
     const scaleX = bounds.size.x / logicalWidth;
@@ -683,7 +705,10 @@ export class SpineRenderer {
   captureFrame(width, height, options = {}) {
     const skel = this.#skeletons['0'];
     if (!skel) return null;
-    const { skeleton, bounds } = skel;
+    const { skeleton } = skel;
+    // Use reference bounds for consistent MVP when layers are grouped; fall back to natural bounds.
+    // When ignoreTransform is true (export-at-original), always use the natural skeleton bounds.
+    const bounds = options.ignoreTransform ? skel.bounds : (this._referenceBounds ?? skel.bounds);
     const originalMvp = this.#mvp.copy();
     const tempCanvas = document.createElement('canvas');
     tempCanvas.width = width;
